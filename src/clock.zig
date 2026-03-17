@@ -1,19 +1,33 @@
 const std = @import("std");
 
-pub const LogicalClock = struct {
-    ts_sequence: u64 = 0,
+pub fn assertLogicalClock(comptime T: type) void {
+    comptime {
+        if (!@hasDecl(T, "getTimestamp")) {
+            @compileError(@typeName(T) ++ " must declare: getTimestamp(self: *T) u64");
+        }
 
-    pub fn init() LogicalClock {
-        return .{ .ts_sequence = 0 };
+        if (!@hasDecl(T, "reset")) {
+            @compileError(@typeName(T) ++ " must declare: reset(self, *T, ts: u64) void");
+        }
+    }
+}
+
+pub const LocalClock = struct {
+    ts_sequence: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+
+    pub fn init() LocalClock {
+        return .{};
     }
 
-    /// Return the current timestamp and return the increment
-    pub fn get_timestamp(self: *LogicalClock) u64 {
-        return @atomicRmw(u64, &self.ts_sequence, .Add, 1, .seq_cst);
+    pub fn getTimeStamp(self: *LocalClock) u64 {
+        return self.ts_sequence.fetchAdd(1, .seq_cst);
     }
 
-    /// Reset the clock to a specific timestamp
-    pub fn reset(self: *LogicalClock, ts: u64) void {
-        @atomicStore(u64, &self.ts_sequence, ts, .seq_cst);
+    pub fn reset(self: *LocalClock, ts: u64) void {
+        self.ts_sequence.store(ts, .seq_cst);
+    }
+
+    pub fn peek(self: *const LocalClock) u64 {
+        return self.ts_sequence.load(.seq_cst);
     }
 };
