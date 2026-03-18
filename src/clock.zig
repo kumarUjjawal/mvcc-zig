@@ -7,7 +7,7 @@ pub fn assertLogicalClock(comptime T: type) void {
         }
 
         if (!@hasDecl(T, "reset")) {
-            @compileError(@typeName(T) ++ " must declare: reset(self, *T, ts: u64) void");
+            @compileError(@typeName(T) ++ " must declare: reset(self: *T, ts: u64) void");
         }
     }
 }
@@ -19,7 +19,7 @@ pub const LocalClock = struct {
         return .{};
     }
 
-    pub fn getTimeStamp(self: *LocalClock) u64 {
+    pub fn getTimestamp(self: *LocalClock) u64 {
         return self.ts_sequence.fetchAdd(1, .seq_cst);
     }
 

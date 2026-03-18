@@ -1,6 +1,6 @@
 const std = @import("std");
 
-pub fn assertStorage(comptime T: type) type {
+pub fn assertStorage(comptime T: type) void {
     comptime {
         if (!@hasDecl(T, "appendLogRecord")) {
             @compileError(@typeName(T) ++ " must declare appendLogRecord(self: *T, record: anytype) !void");
@@ -14,7 +14,7 @@ pub fn assertStorage(comptime T: type) type {
 
 pub const NullStorage = struct {
     pub fn init() NullStorage {
-        retun .{};
+        return .{};
     }
 
     pub fn deinit(self: *NullStorage, allocator: std.mem.Allocator) void {
@@ -22,7 +22,7 @@ pub const NullStorage = struct {
         _ = allocator;
     }
 
-    pub fn appendLogRecord(self: *NullStorage, record: anytpe) !void {
+    pub fn appendLogRecord(self: *NullStorage, record: anytype) !void {
         _ = self;
         _ = record;
     }

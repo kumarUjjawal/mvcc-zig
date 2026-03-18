@@ -4,7 +4,7 @@ const storage_mod = @import("../persistent_storage/storage.zig");
 
 pub const TxId = u64;
 
-pub fn Database(comptime RowType: type, comptime ClockType: type, comptime: StorageType: type) type {
+pub fn Database(comptime RowType: type, comptime ClockType: type, comptime StorageType: type) type {
     clock_mod.assertLogicalClock(ClockType);
     storage_mod.assertStorage(StorageType);
 
@@ -36,8 +36,8 @@ pub fn Database(comptime RowType: type, comptime ClockType: type, comptime: Stor
             return self.tx_ids.fetchAdd(1, .seq_cst);
         }
 
-        pub fn biginTx(self: *Self) TxId {
-            return nextTxId();
+        pub fn beginTx(self: *Self) TxId {
+            return self.nextTxId();
         }
 
         pub fn nextTimestamp(self: *Self) u64 {
@@ -48,16 +48,18 @@ pub fn Database(comptime RowType: type, comptime ClockType: type, comptime: Stor
             self.clock.reset(ts);
         }
 
-        pub fn appendCommittedWrites(self: *Self
+        pub fn appendCommittedWrites(
+            self: *Self,
             tx_id: TxId,
-            rows: []const RowType,) !u64 {
-                const commit_ts = self.nextTimestamp();
-                try self.storage.appendLogRecord(. {
-                    .tx_id = tx_id,
-                    .commit_ts = commit_ts,
-                    .rows = rows,
-                });
-                return commit_ts;
-            }
+            rows: []const RowType,
+        ) !u64 {
+            const commit_ts = self.nextTimestamp();
+            try self.storage.appendLogRecord(.{
+                .tx_id = tx_id,
+                .commit_ts = commit_ts,
+                .rows = rows,
+            });
+            return commit_ts;
+        }
     };
 }
