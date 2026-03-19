@@ -25,7 +25,11 @@ pub const TransactionState = union(TransactionStateTag) {
             .preparing => 1,
             .aborted => 2,
             .terminated => 3,
-            .committed => |ts| 0x8000_0000_0000 | ts,
+            .committed => |ts| blk: {
+                // Highest bit is reserved as the "committed timestamp" tag.
+                std.debug.assert((ts & 0x8000_0000_0000_0000) == 0);
+                break :blk 0x8000_0000_0000_0000 | ts;
+            },
         };
     }
 
@@ -34,7 +38,7 @@ pub const TransactionState = union(TransactionStateTag) {
             0 => .{ .active = {} },
             1 => .{ .preparing = {}},
             2 => .{ .aborted = {}},
-            3 => .{ terminated = {}},
+            3 => .{ .terminated = {}},
             else => if ((v & 0x8000_0000_0000_0000) != 0)
                 .{ .committed = (v & 0x7fff_ffff_ffff_ffff)}
                 else

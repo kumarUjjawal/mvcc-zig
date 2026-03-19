@@ -64,3 +64,9 @@ pub fn Database(comptime RowType: type, comptime ClockType: type, comptime Stora
         }
     };
 }
+
+pub fn isVisibleAt(tx_begin_ts: u64, rv_begin_ts: u64, rv_end_ts: ?u64) bool {
+    if (tx_begin_ts < rv_begin_ts) return false;
+    if (rv_end_ts) |e| return tx_begin_ts < e;
+    return true;
+}
