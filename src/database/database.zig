@@ -11,6 +11,7 @@ pub const DbError = error{
     NoSuchTransaction,
     TxNotActive,
     InvalidStateTransition,
+    OutOfMemory,
 };
 
 pub fn Database(comptime RowType: type, comptime ClockType: type, comptime StorageType: type) type {
@@ -86,6 +87,7 @@ pub fn Database(comptime RowType: type, comptime ClockType: type, comptime Stora
             tx.state = .{ .preparing = {} };
 
             const commit_ts = self.nextTimestamp();
+            try self.materializeTxBoundaries(tx_id, tx.begin_ts, commit_ts);
 
             if (!tx_mod.canTransition(tx.state, .{ .committed = commit_ts })) {
                 return DbError.InvalidStateTransition;
@@ -177,6 +179,78 @@ pub fn Database(comptime RowType: type, comptime ClockType: type, comptime Stora
                 },
                 else => DbError.TxNotActive,
             };
+        }
+
+        pub fn insert(self: *Self, tx_id: TxId, row_id: RowId, row: RowType) DbError!void {
+            _ = try self.ensureTxActive(tx_id);
+            const list = try self.getOrCreateVersionList(row_id);
+            try list.append(self.allocator, .{
+                .begin = .{ .tx_id = tx_id },
+                .end = null,
+                .row = row,
+            });
+        }
+
+        pub fn delete(self: *Self, tx_id: TxId, row_id: RowId) DbError!bool {
+            const tx = try self.ensureTxActive(tx_id);
+            const current = self.latestVisibleVersion(row_id, tx.begin_ts) orelse return false;
+
+            const list = self.versions.getPtr(row_id) orelse return false;
+            if (list.items.len == 0) return false;
+
+            var idx: usize = list.items.len;
+            while (idx > 0) : (idx -= 1) {
+                const rv = &list.items[idx - 1];
+                if (rv.row.id == current.row.id and mvcc.isVisibleVersion(RowType, TxId, tx.begin_ts, rv.*)) {
+                    rv.end = .{ .tx_id = tx_id };
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        fn ensureTxActive(self: *const Self, tx_id: TxId) DbError!tx_mod.Transaction {
+            const tx = self.txs.get(tx_id) orelse return DbError.NoSuchTransaction;
+            return switch (tx.state) {
+                .active => tx,
+                else => DbError.TxNotActive,
+            };
+        }
+
+        fn getOrCreateVersionList(self: *Self, row_id: RowId) !*VersionList {
+            const gop = try self.versions.getOrPut(row_id);
+            if (!gop.found_existing) gop.value_ptr.* = try VersionList.initCapacity(self.allocator, 0);
+            return gop.value_ptr;
+        }
+
+        fn materializeTxBoundaries(self: *Self, tx_id: TxId, begin_ts: u64, commit_ts: u64) !void {
+            var map_it = self.versions.valueIterator();
+            while (map_it.next()) |list| {
+                var i: usize = 0;
+                while (i < list.items.len) : (i += 1) {
+                    var rv = &list.items[i];
+
+                    switch (rv.begin) {
+                        .tx_id => |id| {
+                            if (id == tx_id) {
+                                rv.begin = .{ .timestamp = begin_ts };
+                            }
+                        },
+                        else => {},
+                    }
+
+                    if (rv.end) |end_val| {
+                        switch (end_val) {
+                            .tx_id => |id| {
+                                if (id == tx_id) {
+                                    rv.end = .{ .timestamp = commit_ts };
+                                }
+                            },
+                            else => {},
+                        }
+                    }
+                }
+            }
         }
     };
 }

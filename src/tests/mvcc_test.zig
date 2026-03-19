@@ -42,3 +42,8 @@ test "isVisibleVersion requires resolved timestamp boundaries" {
 
     try testing.expect(!mvcc.isVisibleVersion(u64, u64, 10, begin_unresolved));
 }
+
+test "isVisibleAt treats end as exclusive" {
+    try testing.expect(mvcc.isVisibleAt(9, 5, 10));
+    try testing.expect(!mvcc.isVisibleAt(10, 5, 10));
+}

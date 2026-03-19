@@ -128,3 +128,37 @@ test "Database: beginTx inserts tx metadata and read uses tx begin timestamp" {
     const row = (try db.read(tx_id, 1)) orelse return error.TestUnexpectedResult;
     try testing.expectEqualStrings("old", row.value);
 }
+
+test "Database: insert creates tx-scoped version and commit materializes timestamps" {
+    const DB = db_mod.Database(Row, MockClock, MockStorage);
+    var db = DB.init(testing.allocator, .{ .next = 200 }, .{});
+    defer db.deinit();
+
+    const tx_id = try db.beginTx(); // begin_ts = 200
+    try db.insert(tx_id, 10, .{ .id = 10, .value = "hello" });
+
+    // unresolved tx-id boundaries are not visible in this skeleton
+    try testing.expect((try db.read(tx_id, 10)) == null);
+
+    const commit_ts = try db.commitTx(tx_id);
+    try testing.expectEqual(@as(u64, 201), commit_ts);
+
+    const tx2 = try db.beginTx(); // begin_ts = 202
+    const row = (try db.read(tx2, 10)) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("hello", row.value);
+}
+
+test "Database: delete marks visible version end and hides at end timestamp" {
+    const DB = db_mod.Database(Row, MockClock, MockStorage);
+    var db = DB.init(testing.allocator, .{ .next = 300 }, .{});
+    defer db.deinit();
+
+    try db.insertVersion(5, 250, null, .{ .id = 5, .value = "alive" });
+
+    const tx_id = try db.beginTx(); // begin_ts = 300
+    try testing.expect(try db.delete(tx_id, 5));
+    _ = try db.commitTx(tx_id); // commit_ts = 301
+
+    const tx_after_end = try db.beginTx(); // begin_ts = 302
+    try testing.expect((try db.read(tx_after_end, 5)) == null);
+}
