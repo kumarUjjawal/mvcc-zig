@@ -54,3 +54,35 @@ pub fn RowVersion(comptime RowType: type, comptime TxIdType: type) type {
         row: RowType,
     };
 }
+
+pub fn isVisibleAt(
+    tx_begin_ts: Timestamp,
+    rv_begin_ts: Timestamp,
+    rv_end_ts: ?Timestamp,
+) bool {
+    if (tx_begin_ts < rv_begin_ts) return false;
+    if (rv_end_ts) |end_ts| return tx_begin_ts < end_ts;
+    return true;
+}
+
+pub fn isVisibleVersion(
+    comptime RowType: type,
+    comptime TxIdType: type,
+    tx_begin_ts: Timestamp,
+    rv: RowVersion(RowType, TxIdType),
+) bool {
+    const begin_ts = switch (rv.begin) {
+        .timestamp => |ts| ts,
+        .tx_id => return false,
+    };
+
+    const end_ts: ?Timestamp = if (rv.end) |e|
+        switch (e) {
+            .timestamp => |ts| ts,
+            .tx_id => return false,
+        }
+    else
+        null;
+
+    return isVisibleAt(tx_begin_ts, begin_ts, end_ts);
+}

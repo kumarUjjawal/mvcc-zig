@@ -88,3 +88,32 @@ test "Database: appendCommittedWrites writes tx id, commit ts, and rows to stora
     try testing.expectEqual(@as(u64, 500), db.storage.last_commit_ts);
     try testing.expectEqual(@as(usize, 2), db.storage.last_row_count);
 }
+
+test "Database: latestVisibleVersion resolves newest visible version" {
+    const DB = db_mod.Database(Row, MockClock, MockStorage);
+    var db = DB.init(testing.allocator, .{}, .{});
+    defer db.deinit();
+
+    try db.insertVersion(1, 10, 20, .{ .id = 1, .value = "v1"});
+    try db.insertVersion(1, 20, null, .{ .id = 1, .value = "v2"});
+
+    const at_15 = db.latestVisibleVersion(1, 15) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("v1", at_15.row.value);
+
+
+    const at_25 = db.latestVisibleVersion(1, 25) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("v2", at_25.row.value);
+
+}
+
+test "Database: closeLatestVersion sets tombstone boundary" {
+    const DB = db_mod.Database(Row, MockClock, MockStorage);
+    var db = DB.init(testing.allocator, .{}, .{});
+    defer db.deinit();
+
+    try db.insertVersion(7, 5, null, .{ .id = 7, .value = "alive"});
+    try testing.expect(try db.closeLatestVersion(7,9));
+
+    try testing.expect(db.latestVisibleVersion(7,8) != null);
+    try testing.expect(db.latestVisibleVersion(7, 9) == null);
+}

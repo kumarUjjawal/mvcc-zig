@@ -4,10 +4,14 @@ const clock_mod = @import("../clock.zig");
 const storage_mod = @import("../persistent_storage/storage.zig");
 
 pub const TxId = u64;
+pub const RowId = u64;
 
 pub fn Database(comptime RowType: type, comptime ClockType: type, comptime StorageType: type) type {
     clock_mod.assertLogicalClock(ClockType);
     storage_mod.assertStorage(StorageType);
+
+    const Version = mvcc.RowVersion(RowType, TxId);
+    const VersionList = std.ArrayList(Version);
 
     return struct {
         const Self = @This();
@@ -15,7 +19,8 @@ pub fn Database(comptime RowType: type, comptime ClockType: type, comptime Stora
         allocator: std.mem.Allocator,
         clock: ClockType,
         storage: StorageType,
-        tx_ids: std.atomic.Value(u64) = std.atomic.Value(u64).init(1),
+        tx_ids: std.atomic.Value(u64),
+        versions: std.AutoHashMap(RowId, VersionList),
 
         pub fn init(
             allocator: std.mem.Allocator,
@@ -26,10 +31,15 @@ pub fn Database(comptime RowType: type, comptime ClockType: type, comptime Stora
                 .allocator = allocator,
                 .clock = clock,
                 .storage = storage,
+                .tx_ids = std.atomic.Value(u64).init(1),
+                .versions = std.AutoHashMap(RowId, VersionList).init(allocator),
             };
         }
 
         pub fn deinit(self: *Self) void {
+            var it = self.versions.valueIterator();
+            while (it.next()) |list| list.deinit(self.allocator);
+            self.versions.deinit();
             self.storage.deinit(self.allocator);
         }
 
@@ -62,11 +72,49 @@ pub fn Database(comptime RowType: type, comptime ClockType: type, comptime Stora
             });
             return commit_ts;
         }
-    };
-}
 
-pub fn isVisibleAt(tx_begin_ts: u64, rv_begin_ts: u64, rv_end_ts: ?u64) bool {
-    if (tx_begin_ts < rv_begin_ts) return false;
-    if (rv_end_ts) |e| return tx_begin_ts < e;
-    return true;
+        pub fn insertVersion(
+            self: *Self,
+            row_id: RowId,
+            begin_ts: u64,
+            end_ts: ?u64,
+            row: RowType,
+        ) !void {
+            const gop = try self.versions.getOrPut(row_id);
+            if (!gop.found_existing) gop.value_ptr.* = try VersionList.initCapacity(self.allocator, 0);
+
+            try gop.value_ptr.append(self.allocator, .{
+                .begin = .{ .timestamp = begin_ts },
+                .end = if (end_ts) |v| .{ .timestamp = v } else null,
+                .row = row,
+            });
+        }
+
+        pub fn closeLatestVersion(
+            self: *Self,
+            row_id: RowId,
+            end_ts: u64,
+        ) !bool {
+            const list = self.versions.getPtr(row_id) orelse return false;
+            if (list.items.len == 0) return false;
+            list.items[list.items.len - 1].end = .{ .timestamp = end_ts };
+            return true;
+        }
+
+        pub fn latestVisibleVersion(
+            self: *const Self,
+            row_id: RowId,
+            tx_begin_ts: u64,
+        ) ?*const Version {
+            const list = self.versions.getPtr(row_id) orelse return null;
+            var i: usize = list.items.len;
+            while (i > 0) : (i -= 1) {
+                const rv = &list.items[i - 1];
+                if (mvcc.isVisibleVersion(RowType, TxId, tx_begin_ts, rv.*)) {
+                    return rv;
+                }
+            }
+            return null;
+        }
+    };
 }
