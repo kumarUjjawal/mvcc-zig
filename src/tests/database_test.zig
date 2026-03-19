@@ -47,9 +47,9 @@ test "Database: beginTx yields unique ids starting at 1" {
     var db = DB.init(testing.allocator, .{}, .{});
     defer db.deinit();
 
-    const t1 = db.beginTx();
-    const t2 = db.beginTx();
-    const t3 = db.beginTx();
+    const t1 = try db.beginTx();
+    const t2 = try db.beginTx();
+    const t3 = try db.beginTx();
 
     try testing.expectEqual(@as(u64, 1), t1);
     try testing.expectEqual(@as(u64, 2), t2);
@@ -94,16 +94,14 @@ test "Database: latestVisibleVersion resolves newest visible version" {
     var db = DB.init(testing.allocator, .{}, .{});
     defer db.deinit();
 
-    try db.insertVersion(1, 10, 20, .{ .id = 1, .value = "v1"});
-    try db.insertVersion(1, 20, null, .{ .id = 1, .value = "v2"});
+    try db.insertVersion(1, 10, 20, .{ .id = 1, .value = "v1" });
+    try db.insertVersion(1, 20, null, .{ .id = 1, .value = "v2" });
 
     const at_15 = db.latestVisibleVersion(1, 15) orelse return error.TestUnexpectedResult;
     try testing.expectEqualStrings("v1", at_15.row.value);
 
-
     const at_25 = db.latestVisibleVersion(1, 25) orelse return error.TestUnexpectedResult;
     try testing.expectEqualStrings("v2", at_25.row.value);
-
 }
 
 test "Database: closeLatestVersion sets tombstone boundary" {
@@ -111,9 +109,22 @@ test "Database: closeLatestVersion sets tombstone boundary" {
     var db = DB.init(testing.allocator, .{}, .{});
     defer db.deinit();
 
-    try db.insertVersion(7, 5, null, .{ .id = 7, .value = "alive"});
-    try testing.expect(try db.closeLatestVersion(7,9));
+    try db.insertVersion(7, 5, null, .{ .id = 7, .value = "alive" });
+    try testing.expect(try db.closeLatestVersion(7, 9));
 
-    try testing.expect(db.latestVisibleVersion(7,8) != null);
+    try testing.expect(db.latestVisibleVersion(7, 8) != null);
     try testing.expect(db.latestVisibleVersion(7, 9) == null);
+}
+
+test "Database: beginTx inserts tx metadata and read uses tx begin timestamp" {
+    const DB = db_mod.Database(Row, MockClock, MockStorage);
+    var db = DB.init(testing.allocator, .{ .next = 100 }, .{});
+    defer db.deinit();
+
+    const tx_id = try db.beginTx();
+    try db.insertVersion(1, 90, 110, .{ .id = 1, .value = "old" });
+    try db.insertVersion(1, 110, null, .{ .id = 1, .value = "new" });
+
+    const row = (try db.read(tx_id, 1)) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("old", row.value);
 }

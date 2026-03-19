@@ -1,10 +1,17 @@
 const std = @import("std");
 const mvcc = @import("mvcc.zig");
+const tx_mod = @import("transaction.zig");
 const clock_mod = @import("../clock.zig");
 const storage_mod = @import("../persistent_storage/storage.zig");
 
 pub const TxId = u64;
 pub const RowId = u64;
+
+pub const DbError = error{
+    NoSuchTransaction,
+    TxNotActive,
+    InvalidStateTransition,
+};
 
 pub fn Database(comptime RowType: type, comptime ClockType: type, comptime StorageType: type) type {
     clock_mod.assertLogicalClock(ClockType);
@@ -21,6 +28,7 @@ pub fn Database(comptime RowType: type, comptime ClockType: type, comptime Stora
         storage: StorageType,
         tx_ids: std.atomic.Value(u64),
         versions: std.AutoHashMap(RowId, VersionList),
+        txs: std.AutoHashMap(TxId, tx_mod.Transaction),
 
         pub fn init(
             allocator: std.mem.Allocator,
@@ -33,6 +41,7 @@ pub fn Database(comptime RowType: type, comptime ClockType: type, comptime Stora
                 .storage = storage,
                 .tx_ids = std.atomic.Value(u64).init(1),
                 .versions = std.AutoHashMap(RowId, VersionList).init(allocator),
+                .txs = std.AutoHashMap(TxId, tx_mod.Transaction).init(allocator),
             };
         }
 
@@ -40,15 +49,12 @@ pub fn Database(comptime RowType: type, comptime ClockType: type, comptime Stora
             var it = self.versions.valueIterator();
             while (it.next()) |list| list.deinit(self.allocator);
             self.versions.deinit();
+            self.txs.deinit();
             self.storage.deinit(self.allocator);
         }
 
         pub fn nextTxId(self: *Self) TxId {
             return self.tx_ids.fetchAdd(1, .seq_cst);
-        }
-
-        pub fn beginTx(self: *Self) TxId {
-            return self.nextTxId();
         }
 
         pub fn nextTimestamp(self: *Self) u64 {
@@ -57,6 +63,57 @@ pub fn Database(comptime RowType: type, comptime ClockType: type, comptime Stora
 
         pub fn resetClock(self: *Self, ts: u64) void {
             self.clock.reset(ts);
+        }
+
+        pub fn beginTx(self: *Self) !TxId {
+            const tx_id = self.nextTxId();
+            const begin_ts = self.nextTimestamp();
+
+            try self.txs.put(tx_id, .{
+                .begin_ts = begin_ts,
+                .state = .{ .active = {} },
+            });
+
+            return tx_id;
+        }
+
+        pub fn commitTx(self: *Self, tx_id: TxId) DbError!u64 {
+            const tx = self.txs.getPtr(tx_id) orelse return DbError.NoSuchTransaction;
+
+            if (!tx_mod.canTransition(tx.state, .{ .preparing = {} })) {
+                return DbError.InvalidStateTransition;
+            }
+            tx.state = .{ .preparing = {} };
+
+            const commit_ts = self.nextTimestamp();
+
+            if (!tx_mod.canTransition(tx.state, .{ .committed = commit_ts })) {
+                return DbError.InvalidStateTransition;
+            }
+            tx.state = .{ .committed = commit_ts };
+
+            return commit_ts;
+        }
+
+        pub fn rollbackTx(self: *Self, tx_id: TxId) DbError!void {
+            const tx = self.txs.getPtr(tx_id) orelse return DbError.NoSuchTransaction;
+            if (!tx_mod.canTransition(tx.state, .{ .aborted = {} })) {
+                return DbError.InvalidStateTransition;
+            }
+            tx.state = .{ .aborted = {} };
+        }
+
+        pub fn terminateTx(self: *Self, tx_id: TxId) DbError!void {
+            const tx = self.txs.getPtr(tx_id) orelse return DbError.NoSuchTransaction;
+            if (!tx_mod.canTransition(tx.state, .{ .terminated = {} })) {
+                return DbError.InvalidStateTransition;
+            }
+            tx.state = .{ .terminated = {} };
+        }
+
+        pub fn getTxBeginTs(self: *const Self, tx_id: TxId) DbError!u64 {
+            const tx = self.txs.get(tx_id) orelse return DbError.NoSuchTransaction;
+            return tx.begin_ts;
         }
 
         pub fn appendCommittedWrites(
@@ -90,11 +147,7 @@ pub fn Database(comptime RowType: type, comptime ClockType: type, comptime Stora
             });
         }
 
-        pub fn closeLatestVersion(
-            self: *Self,
-            row_id: RowId,
-            end_ts: u64,
-        ) !bool {
+        pub fn closeLatestVersion(self: *Self, row_id: RowId, end_ts: u64) !bool {
             const list = self.versions.getPtr(row_id) orelse return false;
             if (list.items.len == 0) return false;
             list.items[list.items.len - 1].end = .{ .timestamp = end_ts };
@@ -110,11 +163,20 @@ pub fn Database(comptime RowType: type, comptime ClockType: type, comptime Stora
             var i: usize = list.items.len;
             while (i > 0) : (i -= 1) {
                 const rv = &list.items[i - 1];
-                if (mvcc.isVisibleVersion(RowType, TxId, tx_begin_ts, rv.*)) {
-                    return rv;
-                }
+                if (mvcc.isVisibleVersion(RowType, TxId, tx_begin_ts, rv.*)) return rv;
             }
             return null;
+        }
+
+        pub fn read(self: *const Self, tx_id: TxId, row_id: RowId) DbError!?RowType {
+            const tx = self.txs.get(tx_id) orelse return DbError.NoSuchTransaction;
+            return switch (tx.state) {
+                .active, .preparing, .committed => {
+                    const rv = self.latestVisibleVersion(row_id, tx.begin_ts) orelse return null;
+                    return rv.row;
+                },
+                else => DbError.TxNotActive,
+            };
         }
     };
 }
