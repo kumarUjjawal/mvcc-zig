@@ -1,4 +1,5 @@
 const std = @import("std");
+const mvcc = @import("mvcc.zig");
 const clock_mod = @import("../clock.zig");
 const storage_mod = @import("../persistent_storage/storage.zig");
 

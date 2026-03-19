@@ -4,6 +4,7 @@ const std = @import("std");
 pub const clock = @import("clock.zig");
 pub const storage = @import("persistent_storage/storage.zig");
 pub const database = @import("database/database.zig");
+pub const mvcc = @import("database/mvcc.zig");
 
 pub fn bufferedPrint() !void {
     // Stdout is for the actual output of your application, for example if you
