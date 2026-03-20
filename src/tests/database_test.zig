@@ -137,8 +137,8 @@ test "Database: insert creates tx-scoped version and commit materializes timesta
     const tx_id = try db.beginTx(); // begin_ts = 200
     try db.insert(tx_id, 10, .{ .id = 10, .value = "hello" });
 
-    // unresolved tx-id boundaries are not visible in this skeleton
-    try testing.expect((try db.read(tx_id, 10)) == null);
+    const own_row = (try db.read(tx_id, 10)) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("hello", own_row.value);
 
     const commit_ts = try db.commitTx(tx_id);
     try testing.expectEqual(@as(u64, 201), commit_ts);
@@ -161,4 +161,33 @@ test "Database: delete marks visible version end and hides at end timestamp" {
 
     const tx_after_end = try db.beginTx(); // begin_ts = 302
     try testing.expect((try db.read(tx_after_end, 5)) == null);
+}
+
+test "Database: rollback removes uncommitted inserted versions" {
+    const DB = db_mod.Database(Row, MockClock, MockStorage);
+    var db = DB.init(testing.allocator, .{ .next = 700 }, .{});
+    defer db.deinit();
+
+    const tx1 = try db.beginTx();
+    try db.insert(tx1, 44, .{ .id = 44, .value = "temp" });
+    try db.rollbackTx(tx1);
+
+    const tx2 = try db.beginTx();
+    try testing.expect((try db.read(tx2, 44)) == null);
+}
+
+test "Database: rollback clears uncommitted tombstones" {
+    const DB = db_mod.Database(Row, MockClock, MockStorage);
+    var db = DB.init(testing.allocator, .{ .next = 800 }, .{});
+    defer db.deinit();
+
+    try db.insertVersion(55, 600, null, .{ .id = 55, .value = "keep" });
+
+    const tx1 = try db.beginTx();
+    try testing.expect(try db.delete(tx1, 55));
+    try db.rollbackTx(tx1);
+
+    const tx2 = try db.beginTx();
+    const row = (try db.read(tx2, 55)) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("keep", row.value);
 }
