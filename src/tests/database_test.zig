@@ -191,3 +191,62 @@ test "Database: rollback clears uncommitted tombstones" {
     const row = (try db.read(tx2, 55)) orelse return error.TestUnexpectedResult;
     try testing.expectEqualStrings("keep", row.value);
 }
+
+test "Database: update returns false when target row does not exist" {
+    const DB = db_mod.Database(Row, MockClock, MockStorage);
+    var db = DB.init(testing.allocator, .{ .next = 900 }, .{});
+    defer db.deinit();
+
+    const tx = try db.beginTx();
+    try testing.expect(!(try db.update(tx, 999, .{ .id = 999, .value = "x" })));
+}
+
+test "Database: update replaces existing row and is visible in same tx" {
+    const DB = db_mod.Database(Row, MockClock, MockStorage);
+    var db = DB.init(testing.allocator, .{ .next = 1000 }, .{});
+    defer db.deinit();
+
+    try db.insertVersion(70, 800, null, .{ .id = 70, .value = "old" });
+
+    const tx = try db.beginTx();
+    try testing.expect(try db.update(tx, 70, .{ .id = 70, .value = "new" }));
+
+    const own = (try db.read(tx, 70)) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("new", own.value);
+}
+
+test "Database: upsert inserts when row is missing" {
+    const DB = db_mod.Database(Row, MockClock, MockStorage);
+    var db = DB.init(testing.allocator, .{ .next = 1100 }, .{});
+    defer db.deinit();
+
+    const tx1 = try db.beginTx();
+    try db.upsert(tx1, 80, .{ .id = 80, .value = "v1" });
+    _ = try db.commitTx(tx1);
+
+    const tx2 = try db.beginTx();
+    const row = (try db.read(tx2, 80)) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("v1", row.value);
+}
+
+test "Database: upsert overwrites existing committed row" {
+    const DB = db_mod.Database(Row, MockClock, MockStorage);
+    var db = DB.init(testing.allocator, .{ .next = 1200 }, .{});
+    defer db.deinit();
+
+    const tx1 = try db.beginTx();
+    try db.insert(tx1, 81, .{ .id = 81, .value = "v1" });
+    _ = try db.commitTx(tx1);
+
+    const tx2 = try db.beginTx();
+    try db.upsert(tx2, 81, .{ .id = 81, .value = "v2" });
+
+    const own = (try db.read(tx2, 81)) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("v2", own.value);
+
+    _ = try db.commitTx(tx2);
+
+    const tx3 = try db.beginTx();
+    const row = (try db.read(tx3, 81)) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("v2", row.value);
+}
