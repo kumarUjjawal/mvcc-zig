@@ -205,6 +205,74 @@ pub fn Database(comptime RowType: type, comptime ClockType: type, comptime Stora
             return try out.toOwnedSlice(allocator);
         }
 
+        pub fn dropUnusedRowVersions(self: *Self) DbError!usize {
+            const oldest_active_begin_ts = self.oldestActiveBeginTs();
+            var removed: usize = 0;
+
+            var empty_keys = try std.ArrayList(RowId).initCapacity(self.allocator, 0);
+            defer empty_keys.deinit(self.allocator);
+
+            var it = self.versions.iterator();
+            while (it.next()) |entry| {
+                const row_id = entry.key_ptr.*;
+                const list = entry.value_ptr;
+
+                var i: usize = 0;
+                while (i < list.items.len) {
+                    const rv = list.items[i];
+                    var should_drop = false;
+
+                    switch (rv.begin) {
+                        .timestamp => {
+                            if (rv.end) |end_union| {
+                                switch (end_union) {
+                                    .timestamp => |end_ts| {
+                                        should_drop = if (oldest_active_begin_ts) |oldest|
+                                            end_ts <= oldest
+                                        else
+                                            true;
+                                    },
+                                    .tx_id => {},
+                                }
+                            }
+                        },
+                        .tx_id => {},
+                    }
+
+                    if (should_drop) {
+                        _ = list.orderedRemove(i);
+                        removed += 1;
+                        continue;
+                    }
+                    i += 1;
+                }
+
+                if (list.items.len == 0) {
+                    try empty_keys.append(self.allocator, row_id);
+                }
+            }
+
+            for (empty_keys.items) |row_id| {
+                _ = self.versions.remove(row_id);
+            }
+
+            return removed;
+        }
+
+        fn oldestActiveBeginTs(self: *const Self) ?u64 {
+            var oldest: ?u64 = null;
+            var tx_it = self.txs.valueIterator();
+            while (tx_it.next()) |tx| {
+                switch (tx.state) {
+                    .active, .preparing => {
+                        if (oldest == null or tx.begin_ts < oldest.?) oldest = tx.begin_ts;
+                    },
+                    else => {},
+                }
+            }
+            return oldest;
+        }
+
         fn isVisibleForTx(self: *const Self, tx_id: TxId, tx_begin_ts: u64, rv: Version) bool {
             _ = self;
             const begin_ok = switch (rv.begin) {

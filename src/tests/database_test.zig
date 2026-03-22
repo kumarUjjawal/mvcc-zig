@@ -283,3 +283,38 @@ test "Database: terminateTx rejects active transaction" {
     const tx = try db.beginTx();
     try testing.expectError(db_mod.DbError.InvalidStateTransition, db.terminateTx(tx));
 }
+
+test "Database: dropUnusedRowVersions removes closed historical version" {
+    const DB = db_mod.Database(Row, MockClock, MockStorage);
+    var db = DB.init(testing.allocator, .{ .next = 100 }, .{});
+    defer db.deinit();
+
+    try db.insertVersion(1, 10, 20, .{ .id = 1, .value = "v1" });
+    try db.insertVersion(1, 20, 30, .{ .id = 1, .value = "v2" });
+    try db.insertVersion(1, 30, null, .{ .id = 1, .value = "v3" });
+
+    const removed = try db.dropUnusedRowVersions();
+    try testing.expectEqual(@as(usize, 2), removed);
+
+    const tx = try db.beginTx();
+    const row = (try db.read(tx, 1)) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("v3", row.value);
+}
+
+test "Database: dropUnusedRowVersions keeps versions needed by active tx snapshot" {
+    const DB = db_mod.Database(Row, MockClock, MockStorage);
+    var db = DB.init(testing.allocator, .{ .next = 15 }, .{});
+    defer db.deinit();
+
+    try db.insertVersion(2, 10, 20, .{ .id = 2, .value = "old" });
+    try db.insertVersion(2, 20, null, .{ .id = 2, .value = "new" });
+
+    const old_tx = try db.beginTx(); // begin_ts = 15, must still see "old"
+    try testing.expectEqual(@as(usize, 0), try db.dropUnusedRowVersions());
+    try testing.expectEqualStrings("old", (try db.read(old_tx, 2)).?.value);
+
+    db.resetClock(25);
+    const new_tx = try db.beginTx();
+    const row = (try db.read(new_tx, 2)) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("new", row.value);
+}
