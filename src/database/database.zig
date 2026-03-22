@@ -182,6 +182,28 @@ pub fn Database(comptime RowType: type, comptime ClockType: type, comptime Stora
             return null;
         }
 
+        pub fn scanRowIds(self: *const Self, allocator: std.mem.Allocator, tx_id: TxId) DbError![]RowId {
+            const tx = self.txs.get(tx_id) orelse return DbError.NoSuchTransaction;
+            switch (tx.state) {
+                .active, .preparing, .committed => {},
+                else => return DbError.TxNotActive,
+            }
+
+            var out = try std.ArrayList(RowId).initCapacity(allocator, 0);
+            errdefer out.deinit(allocator);
+
+            var it = self.versions.iterator();
+            while (it.next()) |entry| {
+                const row_id = entry.key_ptr.*;
+                if (self.latestVisibleVersionForTx(row_id, tx_id, tx.begin_ts) != null) {
+                    try out.append(allocator, row_id);
+                }
+
+                std.mem.sort(RowId, out.items, {}, std.sort.asc(RowId));
+                return try out.toOwnedSlice(allocator);
+            }
+        }
+
         fn isVisibleForTx(self: *const Self, tx_id: TxId, tx_begin_ts: u64, rv: Version) bool {
             _ = self;
             const begin_ok = switch (rv.begin) {
