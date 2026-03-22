@@ -103,7 +103,7 @@ pub fn Database(comptime RowType: type, comptime ClockType: type, comptime Stora
             if (!tx_mod.canTransition(tx.state, .{ .aborted = {} })) {
                 return DbError.InvalidStateTransition;
             }
-            self.cleanupUncommettedTx(tx_id);
+            self.cleanupUncommittedTx(tx_id);
             tx.state = .{ .aborted = {} };
         }
 
@@ -113,6 +113,7 @@ pub fn Database(comptime RowType: type, comptime ClockType: type, comptime Stora
                 return DbError.InvalidStateTransition;
             }
             tx.state = .{ .terminated = {} };
+            _ = self.txs.remove(tx_id);
         }
 
         pub fn getTxBeginTs(self: *const Self, tx_id: TxId) DbError!u64 {
@@ -198,10 +199,10 @@ pub fn Database(comptime RowType: type, comptime ClockType: type, comptime Stora
                 if (self.latestVisibleVersionForTx(row_id, tx_id, tx.begin_ts) != null) {
                     try out.append(allocator, row_id);
                 }
-
-                std.mem.sort(RowId, out.items, {}, std.sort.asc(RowId));
-                return try out.toOwnedSlice(allocator);
             }
+
+            std.mem.sort(RowId, out.items, {}, std.sort.asc(RowId));
+            return try out.toOwnedSlice(allocator);
         }
 
         fn isVisibleForTx(self: *const Self, tx_id: TxId, tx_begin_ts: u64, rv: Version) bool {
@@ -279,7 +280,7 @@ pub fn Database(comptime RowType: type, comptime ClockType: type, comptime Stora
             };
         }
 
-        fn cleanupUncommettedTx(self: *Self, tx_id: TxId) void {
+        fn cleanupUncommittedTx(self: *Self, tx_id: TxId) void {
             var map_it = self.versions.valueIterator();
             while (map_it.next()) |list| {
                 var i: usize = 0;

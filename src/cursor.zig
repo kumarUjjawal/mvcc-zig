@@ -1,11 +1,11 @@
 const std = @import("std");
 const db_mod = @import("database/database.zig");
 
-pub const ScanCursor(comptime RowType: type, comptime ClockType: type, comptime StorageType: type) type {
+pub fn ScanCursor(comptime RowType: type, comptime ClockType: type, comptime StorageType: type) type {
     const DB = db_mod.Database(RowType, ClockType, StorageType);
 
     return struct {
-        const self = @This();
+        const Self = @This();
 
         allocator: std.mem.Allocator,
         db: *const DB,
@@ -13,11 +13,7 @@ pub const ScanCursor(comptime RowType: type, comptime ClockType: type, comptime 
         row_ids: []db_mod.RowId,
         pos: usize = 0,
 
-        pub fn init(
-            allocator: std.mem.Allocator,
-            db: *const DB,
-            tx_id: db_mod.TxId
-        ) !Self {
+        pub fn init(allocator: std.mem.Allocator, db: *const DB, tx_id: db_mod.TxId) !Self {
             const row_ids = try db.scanRowIds(allocator, tx_id);
             return .{
                 .allocator = allocator,
@@ -38,7 +34,12 @@ pub const ScanCursor(comptime RowType: type, comptime ClockType: type, comptime 
             self.deinit();
         }
 
-        pub fn currentRowId(self: *const Self) !?RowType {
+        pub fn currentRowId(self: *const Self) ?db_mod.RowId {
+            if (self.pos >= self.row_ids.len) return null;
+            return self.row_ids[self.pos];
+        }
+
+        pub fn currentRow(self: *const Self) !?RowType {
             const row_id = self.currentRowId() orelse return null;
             return try self.db.read(self.tx_id, row_id);
         }

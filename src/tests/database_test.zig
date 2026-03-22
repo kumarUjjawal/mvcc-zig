@@ -250,3 +250,36 @@ test "Database: upsert overwrites existing committed row" {
     const row = (try db.read(tx3, 81)) orelse return error.TestUnexpectedResult;
     try testing.expectEqualStrings("v2", row.value);
 }
+
+test "Database: terminateTx removes committed transaction from active map" {
+    const DB = db_mod.Database(Row, MockClock, MockStorage);
+    var db = DB.init(testing.allocator, .{ .next = 1300 }, .{});
+    defer db.deinit();
+
+    const tx = try db.beginTx();
+    _ = try db.commitTx(tx);
+    try db.terminateTx(tx);
+
+    try testing.expectError(db_mod.DbError.NoSuchTransaction, db.read(tx, 1));
+}
+
+test "Database: terminateTx removes aborted transaction from active map" {
+    const DB = db_mod.Database(Row, MockClock, MockStorage);
+    var db = DB.init(testing.allocator, .{ .next = 1400 }, .{});
+    defer db.deinit();
+
+    const tx = try db.beginTx();
+    try db.rollbackTx(tx);
+    try db.terminateTx(tx);
+
+    try testing.expectError(db_mod.DbError.NoSuchTransaction, db.read(tx, 1));
+}
+
+test "Database: terminateTx rejects active transaction" {
+    const DB = db_mod.Database(Row, MockClock, MockStorage);
+    var db = DB.init(testing.allocator, .{ .next = 1500 }, .{});
+    defer db.deinit();
+
+    const tx = try db.beginTx();
+    try testing.expectError(db_mod.DbError.InvalidStateTransition, db.terminateTx(tx));
+}

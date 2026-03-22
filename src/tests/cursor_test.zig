@@ -43,7 +43,7 @@ test "ScanCursor iterates visible rows in sorted row-id order" {
     defer db.deinit();
 
     try db.insertVersion(2, 10, null, .{ .id = 2, .value = "b" });
-    try db.inserVersion(1, 10, null, .{ .id = 1, .value = "a" });
+    try db.insertVersion(1, 10, null, .{ .id = 1, .value = "a" });
 
     const tx = try db.beginTx();
 
@@ -53,11 +53,29 @@ test "ScanCursor iterates visible rows in sorted row-id order" {
     try testing.expect(!cursor.isEmpty());
 
     try testing.expectEqual(@as(u64, 1), cursor.currentRowId().?);
-    try testing.expectEqualString("a", (try cursor.currentRow()).?.value);
+    try testing.expectEqualStrings("a", (try cursor.currentRow()).?.value);
 
     try testing.expect(cursor.forward());
     try testing.expectEqual(@as(u64, 2), cursor.currentRowId().?);
-    try testing.expectEqualString("b", (try cursor.currentRow()).?.value);
+    try testing.expectEqualStrings("b", (try cursor.currentRow()).?.value);
 
     try testing.expect(!cursor.forward());
+}
+
+test "ScanCursor is empty when no row is visible" {
+    const DB = db_mod.Database(Row, MockClock, MockStorage);
+    const Cursor = cursor_mod.ScanCursor(Row, MockClock, MockStorage);
+
+    var db = DB.init(testing.allocator, .{ .next = 500 }, .{});
+    defer db.deinit();
+
+    try db.insertVersion(7, 10, 20, .{ .id = 7, .value = "gone" });
+    const tx = try db.beginTx();
+
+    var cursor = try Cursor.init(testing.allocator, &db, tx);
+    defer cursor.deinit();
+
+    try testing.expect(cursor.isEmpty());
+    try testing.expect(cursor.currentRowId() == null);
+    try testing.expect((try cursor.currentRow()) == null);
 }
