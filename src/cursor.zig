@@ -8,12 +8,12 @@ pub fn ScanCursor(comptime RowType: type, comptime ClockType: type, comptime Sto
         const Self = @This();
 
         allocator: std.mem.Allocator,
-        db: *const DB,
+        db: *DB,
         tx_id: db_mod.TxId,
         row_ids: []db_mod.RowId,
         pos: usize = 0,
 
-        pub fn init(allocator: std.mem.Allocator, db: *const DB, tx_id: db_mod.TxId) !Self {
+        pub fn init(allocator: std.mem.Allocator, db: *DB, tx_id: db_mod.TxId) !Self {
             const row_ids = try db.scanRowIds(allocator, tx_id);
             return .{
                 .allocator = allocator,
@@ -39,7 +39,7 @@ pub fn ScanCursor(comptime RowType: type, comptime ClockType: type, comptime Sto
             return self.row_ids[self.pos];
         }
 
-        pub fn currentRow(self: *const Self) !?RowType {
+        pub fn currentRow(self: *Self) !?RowType {
             const row_id = self.currentRowId() orelse return null;
             return try self.db.read(self.tx_id, row_id);
         }

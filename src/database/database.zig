@@ -11,6 +11,7 @@ pub const DbError = error{
     NoSuchTransaction,
     TxNotActive,
     InvalidStateTransition,
+    SerializationConflict,
     OutOfMemory,
     TestUnexpectedResult,
 };
@@ -51,6 +52,8 @@ pub fn Database(comptime RowType: type, comptime ClockType: type, comptime Stora
             var it = self.versions.valueIterator();
             while (it.next()) |list| list.deinit(self.allocator);
             self.versions.deinit();
+            var tx_it = self.txs.valueIterator();
+            while (tx_it.next()) |tx| tx.deinit();
             self.txs.deinit();
             self.storage.deinit(self.allocator);
         }
@@ -71,10 +74,7 @@ pub fn Database(comptime RowType: type, comptime ClockType: type, comptime Stora
             const tx_id = self.nextTxId();
             const begin_ts = self.nextTimestamp();
 
-            try self.txs.put(tx_id, .{
-                .begin_ts = begin_ts,
-                .state = .{ .active = {} },
-            });
+            try self.txs.put(tx_id, try tx_mod.Transaction.init(self.allocator, begin_ts));
 
             return tx_id;
         }
@@ -86,6 +86,12 @@ pub fn Database(comptime RowType: type, comptime ClockType: type, comptime Stora
                 return DbError.InvalidStateTransition;
             }
             tx.state = .{ .preparing = {} };
+
+            if (self.hasSerializableConflict(tx_id, tx)) {
+                self.cleanupUncommittedTx(tx_id);
+                tx.state = .{ .aborted = {} };
+                return DbError.SerializationConflict;
+            }
 
             const commit_ts = self.nextTimestamp();
             try self.materializeTxBoundaries(tx_id, tx.begin_ts, commit_ts);
@@ -113,7 +119,10 @@ pub fn Database(comptime RowType: type, comptime ClockType: type, comptime Stora
                 return DbError.InvalidStateTransition;
             }
             tx.state = .{ .terminated = {} };
-            _ = self.txs.remove(tx_id);
+            if (self.txs.fetchRemove(tx_id)) |kv| {
+                var removed_tx = kv.value;
+                removed_tx.deinit();
+            }
         }
 
         pub fn getTxBeginTs(self: *const Self, tx_id: TxId) DbError!u64 {
@@ -273,6 +282,42 @@ pub fn Database(comptime RowType: type, comptime ClockType: type, comptime Stora
             return oldest;
         }
 
+        fn hasSerializableConflict(self: *const Self, tx_id: TxId, tx: *const tx_mod.Transaction) bool {
+            var it = self.txs.iterator();
+            while (it.next()) |entry| {
+                const other_id = entry.key_ptr.*;
+                if (other_id == tx_id) continue;
+
+                const other = entry.value_ptr.*;
+                const other_commit_ts = switch (other.state) {
+                    .committed => |ts| ts,
+                    else => continue,
+                };
+
+                if (other_commit_ts <= tx.begin_ts) continue;
+
+                if (self.hasIntersection(&tx.write_set, &other.write_set)) return true;
+                if (self.hasIntersection(&tx.read_set, &other.write_set)) return true;
+                if (self.hasIntersection(&tx.write_set, &other.read_set)) return true;
+            }
+
+            return false;
+        }
+
+        fn hasIntersection(
+            self: *const Self,
+            lhs: *const std.AutoHashMap(RowId, void),
+            rhs: *const std.AutoHashMap(RowId, void),
+        ) bool {
+            _ = self;
+            var it = lhs.iterator();
+            while (it.next()) |entry| {
+                const key = entry.key_ptr.*;
+                if (rhs.get(key) != null) return true;
+            }
+            return false;
+        }
+
         fn isVisibleForTx(self: *const Self, tx_id: TxId, tx_begin_ts: u64, rv: Version) bool {
             _ = self;
             const begin_ok = switch (rv.begin) {
@@ -287,10 +332,11 @@ pub fn Database(comptime RowType: type, comptime ClockType: type, comptime Stora
             } else true;
         }
 
-        pub fn read(self: *const Self, tx_id: TxId, row_id: RowId) DbError!?RowType {
-            const tx = self.txs.get(tx_id) orelse return DbError.NoSuchTransaction;
+        pub fn read(self: *Self, tx_id: TxId, row_id: RowId) DbError!?RowType {
+            const tx = self.txs.getPtr(tx_id) orelse return DbError.NoSuchTransaction;
             return switch (tx.state) {
                 .active, .preparing, .committed => {
+                    try tx.markRead(row_id);
                     const rv = self.latestVisibleVersionForTx(row_id, tx_id, tx.begin_ts) orelse return null;
                     return rv.row;
                 },
@@ -299,7 +345,8 @@ pub fn Database(comptime RowType: type, comptime ClockType: type, comptime Stora
         }
 
         pub fn insert(self: *Self, tx_id: TxId, row_id: RowId, row: RowType) DbError!void {
-            _ = try self.ensureTxActive(tx_id);
+            const tx = try self.ensureTxActive(tx_id);
+            try tx.markWrite(row_id);
             const list = try self.getOrCreateVersionList(row_id);
             try list.append(self.allocator, .{
                 .begin = .{ .tx_id = tx_id },
@@ -318,7 +365,8 @@ pub fn Database(comptime RowType: type, comptime ClockType: type, comptime Stora
             var idx: usize = list.items.len;
             while (idx > 0) : (idx -= 1) {
                 const rv = &list.items[idx - 1];
-                if (rv.row.id == current.row.id and mvcc.isVisibleVersion(RowType, TxId, tx.begin_ts, rv.*)) {
+                if (rv.row.id == current.row.id and self.isVisibleForTx(tx_id, tx.begin_ts, rv.*)) {
+                    try tx.markWrite(row_id);
                     rv.end = .{ .tx_id = tx_id };
                     return true;
                 }
@@ -340,8 +388,8 @@ pub fn Database(comptime RowType: type, comptime ClockType: type, comptime Stora
             try self.insert(tx_id, row_id, row);
         }
 
-        fn ensureTxActive(self: *const Self, tx_id: TxId) DbError!tx_mod.Transaction {
-            const tx = self.txs.get(tx_id) orelse return DbError.NoSuchTransaction;
+        fn ensureTxActive(self: *Self, tx_id: TxId) DbError!*tx_mod.Transaction {
+            const tx = self.txs.getPtr(tx_id) orelse return DbError.NoSuchTransaction;
             return switch (tx.state) {
                 .active => tx,
                 else => DbError.TxNotActive,

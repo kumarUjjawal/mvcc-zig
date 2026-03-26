@@ -318,3 +318,75 @@ test "Database: dropUnusedRowVersions keeps versions needed by active tx snapsho
     const row = (try db.read(new_tx, 2)) orelse return error.TestUnexpectedResult;
     try testing.expectEqualStrings("new", row.value);
 }
+
+test "Database: commit rejects write-write conflicts" {
+    const DB = db_mod.Database(Row, MockClock, MockStorage);
+    var db = DB.init(testing.allocator, .{ .next = 2000 }, .{});
+    defer db.deinit();
+
+    const tx1 = try db.beginTx();
+    const tx2 = try db.beginTx();
+
+    try db.insert(tx1, 99, .{ .id = 99, .value = "t1" });
+    try db.insert(tx2, 99, .{ .id = 99, .value = "t2" });
+
+    _ = try db.commitTx(tx1);
+    try testing.expectError(db_mod.DbError.SerializationConflict, db.commitTx(tx2));
+
+    const reader = try db.beginTx();
+    const row = (try db.read(reader, 99)) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("t1", row.value);
+}
+
+test "Database: commit rejects read-write conflicts" {
+    const DB = db_mod.Database(Row, MockClock, MockStorage);
+    var db = DB.init(testing.allocator, .{ .next = 3000 }, .{});
+    defer db.deinit();
+
+    try db.insertVersion(100, 10, null, .{ .id = 100, .value = "base" });
+
+    const tx1 = try db.beginTx();
+    const before = (try db.read(tx1, 100)) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("base", before.value);
+
+    const tx2 = try db.beginTx();
+    try testing.expect(try db.update(tx2, 100, .{ .id = 100, .value = "new" }));
+    _ = try db.commitTx(tx2);
+
+    try testing.expectError(db_mod.DbError.SerializationConflict, db.commitTx(tx1));
+}
+
+test "Database: commit allows non-overlapping writes" {
+    const DB = db_mod.Database(Row, MockClock, MockStorage);
+    var db = DB.init(testing.allocator, .{ .next = 4000 }, .{});
+    defer db.deinit();
+
+    const tx1 = try db.beginTx();
+    const tx2 = try db.beginTx();
+
+    try db.insert(tx1, 501, .{ .id = 501, .value = "a" });
+    try db.insert(tx2, 502, .{ .id = 502, .value = "b" });
+
+    _ = try db.commitTx(tx1);
+    _ = try db.commitTx(tx2);
+
+    const reader = try db.beginTx();
+    try testing.expectEqualStrings("a", (try db.read(reader, 501)).?.value);
+    try testing.expectEqualStrings("b", (try db.read(reader, 502)).?.value);
+}
+
+test "Database: delete can remove own uncommitted insert" {
+    const DB = db_mod.Database(Row, MockClock, MockStorage);
+    var db = DB.init(testing.allocator, .{ .next = 5000 }, .{});
+    defer db.deinit();
+
+    const tx = try db.beginTx();
+    try db.insert(tx, 777, .{ .id = 777, .value = "temp" });
+    try testing.expect(try db.delete(tx, 777));
+    try testing.expect((try db.read(tx, 777)) == null);
+
+    _ = try db.commitTx(tx);
+
+    const reader = try db.beginTx();
+    try testing.expect((try db.read(reader, 777)) == null);
+}
