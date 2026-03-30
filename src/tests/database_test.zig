@@ -2,6 +2,7 @@ const std = @import("std");
 const testing = std.testing;
 
 const db_mod = @import("../database/database.zig");
+const storage_mod = @import("../persistent_storage/storage.zig");
 
 const Row = struct {
     id: u64,
@@ -24,9 +25,11 @@ const MockClock = struct {
 
 const MockStorage = struct {
     append_calls: usize = 0,
-    last_tx_id: u64 = 0,
-    last_commit_ts: u64 = 0,
-    last_row_count: usize = 0,
+    last_tx_timestamp: u64 = 0,
+    last_row_version_count: usize = 0,
+    last_first_row_id: u64 = 0,
+    last_first_begin_ts: u64 = 0,
+    last_first_end_ts: ?u64 = null,
 
     pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
         _ = self;
@@ -35,9 +38,34 @@ const MockStorage = struct {
 
     pub fn appendLogRecord(self: *@This(), record: anytype) !void {
         self.append_calls += 1;
-        self.last_tx_id = record.tx_id;
-        self.last_commit_ts = record.commit_ts;
-        self.last_row_count = record.rows.len;
+        self.last_tx_timestamp = record.tx_timestamp;
+        self.last_row_version_count = record.row_versions.len;
+        self.last_first_row_id = 0;
+        self.last_first_begin_ts = 0;
+        self.last_first_end_ts = null;
+
+        if (record.row_versions.len != 0) {
+            const first = record.row_versions[0];
+            self.last_first_row_id = first.row.id;
+            self.last_first_begin_ts = switch (first.begin) {
+                .timestamp => |ts| ts,
+                .tx_id => 0,
+            };
+            self.last_first_end_ts = if (first.end) |end| switch (end) {
+                .timestamp => |ts| ts,
+                .tx_id => null,
+            } else null;
+        }
+    }
+
+    pub fn readTxLog(
+        self: *@This(),
+        allocator: std.mem.Allocator,
+        comptime RowType: type,
+        comptime TxIdType: type,
+    ) !storage_mod.TxLog(RowType, TxIdType) {
+        _ = self;
+        return storage_mod.TxLog(RowType, TxIdType).initEmpty(allocator);
     }
 };
 
@@ -69,24 +97,23 @@ test "Database: nextTimestamp delegates to clock" {
     try testing.expectEqual(@as(u64, 100), db.nextTimestamp());
 }
 
-test "Database: appendCommittedWrites writes tx id, commit ts, and rows to storage" {
+test "Database: commit logs committed row versions to storage" {
     const DB = db_mod.Database(Row, MockClock, MockStorage);
 
     var db = DB.init(testing.allocator, .{ .next = 500 }, .{});
     defer db.deinit();
 
-    const rows = [_]Row{
-        .{ .id = 1, .value = "a" },
-        .{ .id = 2, .value = "b" },
-    };
+    const tx = try db.beginTx();
+    try db.insert(tx, 1, .{ .id = 1, .value = "a" });
+    const commit_ts = try db.commitTx(tx);
 
-    const commit_ts = try db.appendCommittedWrites(12, rows[0..]);
-
-    try testing.expectEqual(@as(u64, 500), commit_ts);
+    try testing.expectEqual(@as(u64, 501), commit_ts);
     try testing.expectEqual(@as(usize, 1), db.storage.append_calls);
-    try testing.expectEqual(@as(u64, 12), db.storage.last_tx_id);
-    try testing.expectEqual(@as(u64, 500), db.storage.last_commit_ts);
-    try testing.expectEqual(@as(usize, 2), db.storage.last_row_count);
+    try testing.expectEqual(@as(u64, 501), db.storage.last_tx_timestamp);
+    try testing.expectEqual(@as(usize, 1), db.storage.last_row_version_count);
+    try testing.expectEqual(@as(u64, 1), db.storage.last_first_row_id);
+    try testing.expectEqual(@as(u64, 500), db.storage.last_first_begin_ts);
+    try testing.expect(db.storage.last_first_end_ts == null);
 }
 
 test "Database: latestVisibleVersion resolves newest visible version" {
@@ -389,4 +416,91 @@ test "Database: delete can remove own uncommitted insert" {
 
     const reader = try db.beginTx();
     try testing.expect((try db.read(reader, 777)) == null);
+}
+
+test "Database: recover replays committed rows and resets the clock" {
+    const DB = db_mod.Database(Row, MockClock, storage_mod.JsonFileStorage);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const dir_path = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(dir_path);
+
+    const path = try std.fs.path.join(testing.allocator, &.{ dir_path, "recover.log" });
+    defer testing.allocator.free(path);
+
+    {
+        const storage = try storage_mod.JsonFileStorage.init(testing.allocator, path);
+        var db = DB.init(testing.allocator, .{ .next = 100 }, storage);
+        defer db.deinit();
+
+        const tx1 = try db.beginTx();
+        try db.insert(tx1, 1, .{ .id = 1, .value = "alpha" });
+        _ = try db.commitTx(tx1);
+
+        const tx2 = try db.beginTx();
+        try db.insert(tx2, 2, .{ .id = 2, .value = "beta" });
+        _ = try db.commitTx(tx2);
+
+        const tx3 = try db.beginTx();
+        try db.insert(tx3, 999, .{ .id = 999, .value = "rolled-back" });
+        try db.rollbackTx(tx3);
+    }
+
+    {
+        const storage = try storage_mod.JsonFileStorage.init(testing.allocator, path);
+        var db = DB.init(testing.allocator, .{}, storage);
+        defer db.deinit();
+
+        try db.recover();
+
+        try testing.expectEqual(@as(u64, 103), db.nextTimestamp());
+
+        const tx = try db.beginTx();
+        try testing.expectEqualStrings("alpha", (try db.read(tx, 1)).?.value);
+        try testing.expectEqualStrings("beta", (try db.read(tx, 2)).?.value);
+        try testing.expect((try db.read(tx, 999)) == null);
+    }
+}
+
+test "Database: recover replays updates and deletes from the tx log" {
+    const DB = db_mod.Database(Row, MockClock, storage_mod.JsonFileStorage);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const dir_path = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(dir_path);
+
+    const path = try std.fs.path.join(testing.allocator, &.{ dir_path, "recover-updates.log" });
+    defer testing.allocator.free(path);
+
+    {
+        const storage = try storage_mod.JsonFileStorage.init(testing.allocator, path);
+        var db = DB.init(testing.allocator, .{ .next = 200 }, storage);
+        defer db.deinit();
+
+        const seed = try db.beginTx();
+        try db.insert(seed, 7, .{ .id = 7, .value = "old" });
+        try db.insert(seed, 8, .{ .id = 8, .value = "keep" });
+        _ = try db.commitTx(seed);
+
+        const mutate = try db.beginTx();
+        try testing.expect(try db.update(mutate, 7, .{ .id = 7, .value = "new" }));
+        try testing.expect(try db.delete(mutate, 8));
+        _ = try db.commitTx(mutate);
+    }
+
+    {
+        const storage = try storage_mod.JsonFileStorage.init(testing.allocator, path);
+        var db = DB.init(testing.allocator, .{}, storage);
+        defer db.deinit();
+
+        try db.recover();
+
+        const tx = try db.beginTx();
+        try testing.expectEqualStrings("new", (try db.read(tx, 7)).?.value);
+        try testing.expect((try db.read(tx, 8)) == null);
+    }
 }

@@ -33,6 +33,16 @@ const MockStorage = struct {
         _ = self;
         _ = record;
     }
+
+    pub fn readTxLog(
+        self: *@This(),
+        allocator: std.mem.Allocator,
+        comptime RowType: type,
+        comptime TxIdType: type,
+    ) !@import("../persistent_storage/storage.zig").TxLog(RowType, TxIdType) {
+        _ = self;
+        return @import("../persistent_storage/storage.zig").TxLog(RowType, TxIdType).initEmpty(allocator);
+    }
 };
 
 test "ScanCursor iterates visible rows in sorted row-id order" {

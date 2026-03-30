@@ -55,6 +55,13 @@ pub fn RowVersion(comptime RowType: type, comptime TxIdType: type) type {
     };
 }
 
+pub fn LogRecord(comptime RowType: type, comptime TxIdType: type) type {
+    return struct {
+        tx_timestamp: Timestamp,
+        row_versions: []const RowVersion(RowType, TxIdType),
+    };
+}
+
 pub fn isVisibleAt(
     tx_begin_ts: Timestamp,
     rv_begin_ts: Timestamp,

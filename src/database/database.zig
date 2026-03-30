@@ -12,9 +12,8 @@ pub const DbError = error{
     TxNotActive,
     InvalidStateTransition,
     SerializationConflict,
-    OutOfMemory,
     TestUnexpectedResult,
-};
+} || storage_mod.StorageError;
 
 pub fn Database(comptime RowType: type, comptime ClockType: type, comptime StorageType: type) type {
     clock_mod.assertLogicalClock(ClockType);
@@ -22,6 +21,7 @@ pub fn Database(comptime RowType: type, comptime ClockType: type, comptime Stora
 
     const Version = mvcc.RowVersion(RowType, TxId);
     const VersionList = std.ArrayList(Version);
+    const LogRecord = mvcc.LogRecord(RowType, TxId);
 
     return struct {
         const Self = @This();
@@ -32,6 +32,7 @@ pub fn Database(comptime RowType: type, comptime ClockType: type, comptime Stora
         tx_ids: std.atomic.Value(u64),
         versions: std.AutoHashMap(RowId, VersionList),
         txs: std.AutoHashMap(TxId, tx_mod.Transaction),
+        recovery_arenas: std.ArrayList(std.heap.ArenaAllocator),
 
         pub fn init(
             allocator: std.mem.Allocator,
@@ -45,13 +46,13 @@ pub fn Database(comptime RowType: type, comptime ClockType: type, comptime Stora
                 .tx_ids = std.atomic.Value(u64).init(1),
                 .versions = std.AutoHashMap(RowId, VersionList).init(allocator),
                 .txs = std.AutoHashMap(TxId, tx_mod.Transaction).init(allocator),
+                .recovery_arenas = .empty,
             };
         }
 
         pub fn deinit(self: *Self) void {
-            var it = self.versions.valueIterator();
-            while (it.next()) |list| list.deinit(self.allocator);
-            self.versions.deinit();
+            self.clearVersions();
+            self.clearRecoveredArenas();
             var tx_it = self.txs.valueIterator();
             while (tx_it.next()) |tx| tx.deinit();
             self.txs.deinit();
@@ -94,7 +95,20 @@ pub fn Database(comptime RowType: type, comptime ClockType: type, comptime Stora
             }
 
             const commit_ts = self.nextTimestamp();
-            try self.materializeTxBoundaries(tx_id, tx.begin_ts, commit_ts);
+            var log_versions = try self.collectCommittedVersions(tx_id, tx.begin_ts, commit_ts, tx);
+            defer log_versions.deinit(self.allocator);
+
+            if (log_versions.items.len != 0) {
+                self.storage.appendLogRecord(LogRecord{
+                    .tx_timestamp = commit_ts,
+                    .row_versions = log_versions.items,
+                }) catch |err| {
+                    tx.state = .{ .active = {} };
+                    return err;
+                };
+            }
+
+            self.materializeTxBoundaries(tx_id, tx.begin_ts, commit_ts, tx);
 
             if (!tx_mod.canTransition(tx.state, .{ .committed = commit_ts })) {
                 return DbError.InvalidStateTransition;
@@ -128,20 +142,6 @@ pub fn Database(comptime RowType: type, comptime ClockType: type, comptime Stora
         pub fn getTxBeginTs(self: *const Self, tx_id: TxId) DbError!u64 {
             const tx = self.txs.get(tx_id) orelse return DbError.NoSuchTransaction;
             return tx.begin_ts;
-        }
-
-        pub fn appendCommittedWrites(
-            self: *Self,
-            tx_id: TxId,
-            rows: []const RowType,
-        ) !u64 {
-            const commit_ts = self.nextTimestamp();
-            try self.storage.appendLogRecord(.{
-                .tx_id = tx_id,
-                .commit_ts = commit_ts,
-                .rows = rows,
-            });
-            return commit_ts;
         }
 
         pub fn insertVersion(
@@ -212,6 +212,41 @@ pub fn Database(comptime RowType: type, comptime ClockType: type, comptime Stora
 
             std.mem.sort(RowId, out.items, {}, std.sort.asc(RowId));
             return try out.toOwnedSlice(allocator);
+        }
+
+        pub fn recover(self: *Self) DbError!void {
+            if (self.txs.count() != 0) return DbError.InvalidStateTransition;
+
+            self.clearVersions();
+            self.clearRecoveredArenas();
+            errdefer {
+                self.clearVersions();
+                self.clearRecoveredArenas();
+            }
+
+            var tx_log = try self.storage.readTxLog(self.allocator, RowType, TxId);
+            defer tx_log.deinit();
+
+            if (tx_log.records.len != 0) {
+                var retained_arena: ?std.heap.ArenaAllocator = tx_log.releaseArena();
+                errdefer if (retained_arena) |*arena| arena.deinit();
+
+                try self.recovery_arenas.append(self.allocator, retained_arena.?);
+                retained_arena = null;
+            }
+
+            var latest_ts: ?u64 = null;
+            for (tx_log.records) |record| {
+                for (record.row_versions) |rv| {
+                    try self.upsertRecoveredVersion(rv);
+                }
+
+                if (latest_ts == null or record.tx_timestamp > latest_ts.?) {
+                    latest_ts = record.tx_timestamp;
+                }
+            }
+
+            if (latest_ts) |ts| self.resetClock(ts);
         }
 
         pub fn dropUnusedRowVersions(self: *Self) DbError!usize {
@@ -434,13 +469,84 @@ pub fn Database(comptime RowType: type, comptime ClockType: type, comptime Stora
             return gop.value_ptr;
         }
 
-        fn materializeTxBoundaries(self: *Self, tx_id: TxId, begin_ts: u64, commit_ts: u64) !void {
-            var map_it = self.versions.valueIterator();
-            while (map_it.next()) |list| {
-                var i: usize = 0;
-                while (i < list.items.len) : (i += 1) {
-                    var rv = &list.items[i];
+        fn upsertRecoveredVersion(self: *Self, rv: Version) DbError!void {
+            const list = try self.getOrCreateVersionList(rv.row.id);
 
+            if (rv.end != null) {
+                for (list.items) |*existing| {
+                    if (existing.row.id == rv.row.id and sameVersionBegin(existing.begin, rv.begin)) {
+                        existing.* = rv;
+                        return;
+                    }
+                }
+            }
+
+            try list.append(self.allocator, rv);
+        }
+
+        fn collectCommittedVersions(
+            self: *Self,
+            tx_id: TxId,
+            begin_ts: u64,
+            commit_ts: u64,
+            tx: *const tx_mod.Transaction,
+        ) DbError!VersionList {
+            var out = try VersionList.initCapacity(self.allocator, 0);
+            errdefer out.deinit(self.allocator);
+
+            var write_it = tx.write_set.iterator();
+            while (write_it.next()) |entry| {
+                const row_id = entry.key_ptr.*;
+                const list = self.versions.getPtr(row_id) orelse continue;
+
+                for (list.items) |rv| {
+                    var committed = rv;
+                    var touched = false;
+
+                    switch (committed.begin) {
+                        .tx_id => |id| {
+                            if (id == tx_id) {
+                                committed.begin = .{ .timestamp = begin_ts };
+                                touched = true;
+                            }
+                        },
+                        else => {},
+                    }
+
+                    if (committed.end) |end_val| {
+                        switch (end_val) {
+                            .tx_id => |id| {
+                                if (id == tx_id) {
+                                    committed.end = .{ .timestamp = commit_ts };
+                                    touched = true;
+                                }
+                            },
+                            else => {},
+                        }
+                    }
+
+                    if (touched) {
+                        try out.append(self.allocator, committed);
+                    }
+                }
+            }
+
+            return out;
+        }
+
+        fn materializeTxBoundaries(
+            self: *Self,
+            tx_id: TxId,
+            begin_ts: u64,
+            commit_ts: u64,
+            tx: *const tx_mod.Transaction,
+        ) void {
+            var write_it = tx.write_set.iterator();
+            while (write_it.next()) |entry| {
+                const row_id = entry.key_ptr.*;
+                const list = self.versions.getPtr(row_id) orelse continue;
+
+                for (list.items) |*rv| {
                     switch (rv.begin) {
                         .tx_id => |id| {
                             if (id == tx_id) {
@@ -462,6 +568,36 @@ pub fn Database(comptime RowType: type, comptime ClockType: type, comptime Stora
                     }
                 }
             }
+        }
+
+        fn clearVersions(self: *Self) void {
+            var versions = self.versions;
+            self.versions = std.AutoHashMap(RowId, VersionList).init(self.allocator);
+
+            var it = versions.valueIterator();
+            while (it.next()) |list| list.deinit(self.allocator);
+            versions.deinit();
+        }
+
+        fn clearRecoveredArenas(self: *Self) void {
+            for (self.recovery_arenas.items) |*arena| {
+                arena.deinit();
+            }
+            self.recovery_arenas.deinit(self.allocator);
+            self.recovery_arenas = .empty;
+        }
+
+        fn sameVersionBegin(lhs: mvcc.TxTimestampOrId(TxId), rhs: mvcc.TxTimestampOrId(TxId)) bool {
+            return switch (lhs) {
+                .timestamp => |lhs_ts| switch (rhs) {
+                    .timestamp => |rhs_ts| lhs_ts == rhs_ts,
+                    .tx_id => false,
+                },
+                .tx_id => |lhs_id| switch (rhs) {
+                    .timestamp => false,
+                    .tx_id => |rhs_id| lhs_id == rhs_id,
+                },
+            };
         }
     };
 }
